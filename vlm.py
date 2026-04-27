@@ -281,6 +281,31 @@ def validate(slide_doc: dict[str, Any], manifest: dict[str, Any]) -> list[Violat
     texts = [s.get("text", "") for s in shapes if s.get("text")]
     by_id: dict[str, dict[str, Any]] = {s["id"]: s for s in shapes}
 
+    # Reject empty docs when the manifest has substantive content. The model
+    # would sometimes call emit_slide_doc({}) as an early-out on dense slides;
+    # without this check the validator passes (nothing to flag) and the slide
+    # silently renders blank in markdown.
+    has_title = bool(slide_doc.get("slide_title"))
+    has_subtitle = bool(slide_doc.get("slide_subtitle"))
+    has_blocks = bool(slide_doc.get("blocks"))
+    if not (has_title or has_subtitle or has_blocks):
+        manifest_has_text = bool(texts)
+        manifest_has_image = any(s.get("kind") in IMAGE_LIKE_KINDS for s in shapes)
+        if manifest_has_text or manifest_has_image:
+            violations.append(
+                Violation(
+                    block_index=-1,
+                    field="<root>",
+                    value=None,
+                    reason=(
+                        "slide_doc is empty but the manifest has content "
+                        "(text-bearing shapes and/or image-like shapes); "
+                        "emit slide_title, slide_subtitle, and/or blocks"
+                    ),
+                )
+            )
+            return violations
+
     # Top-level scalar text fields.
     _check_text(slide_doc.get("slide_title", ""), "slide_title", -1, texts, violations)
     if slide_doc.get("slide_subtitle"):
