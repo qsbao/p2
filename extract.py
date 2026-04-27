@@ -203,9 +203,18 @@ def _is_image_like(rec: ShapeRecord) -> bool:
 
 def _crop_image(slide_png: Path, rec: ShapeRecord, out_path: Path) -> None:
     """Crop the rec's bbox from slide_png with 2% padding, save as PNG."""
+    crop_bbox(slide_png, rec.bbox_frac, out_path)
+
+
+def crop_bbox(slide_png: Path, bbox_frac: list[float], out_path: Path) -> None:
+    """Crop a bbox (fractional [l, t, w, h]) from slide_png with 2% padding.
+
+    Public so cli.py can lazily crop shapes the VLM referenced but extract
+    didn't pre-crop (e.g. small Groups under GROUP_AREA_THRESHOLD).
+    """
     img = Image.open(slide_png)
     W_px, H_px = img.size
-    l_frac, t_frac, w_frac, h_frac = rec.bbox_frac
+    l_frac, t_frac, w_frac, h_frac = bbox_frac
     pad_px = int(CROP_PAD_FRAC * W_px)
     l_px = max(0, int(l_frac * W_px) - pad_px)
     t_px = max(0, int(t_frac * H_px) - pad_px)

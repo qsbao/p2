@@ -16,17 +16,22 @@ Errors → stderr + nonzero exit. Re-runs overwrite outputs (no caching in v1).
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-from .extract import extract
+from .extract import crop_bbox, extract
 from .log import RunLogger
 from .md import render_md
 from .render import render
 from .vlm import ValidationFailure, call_vlm
+
+
+DEFAULT_VLM_CONCURRENCY = 8
 
 
 def _write_chrome_audit(
@@ -111,27 +116,48 @@ def main(argv: list[str]) -> int:
 
     # 3. VLM call per slide
     t = time.monotonic()
-    log.event("phase.vlm.start", "[3/5] calling VLM per slide")
-    slide_docs: list[dict[str, Any]] = []
-    manifests: list[dict[str, Any]] = []
-    chrome_per_slide: list[dict[str, Any]] = []
     try:
-        for art in artifacts:
-            manifest = json.loads(art.manifest_path.read_text())
-            notes = art.notes_path.read_text()
-            chrome = json.loads(art.chrome_path.read_text())
-            png = pngs[art.slide_index - 1]
-            log.event("vlm.start", f"      slide {art.slide_index} → VLM ...", slide_index=art.slide_index)
-            doc = call_vlm(
-                png, manifest, notes, chrome,
-                debug_dir=debug_dir, slide_index=art.slide_index, logger=log,
-            )
-            slide_docs.append(doc)
-            manifests.append(manifest)
-            chrome_per_slide.append(chrome)
-            (debug_dir / f"slide_doc-{art.slide_index}.json").write_text(
-                json.dumps(doc, indent=2, ensure_ascii=False)
-            )
+        concurrency = int(os.environ.get("PPT2MD_VLM_CONCURRENCY", DEFAULT_VLM_CONCURRENCY))
+    except ValueError:
+        concurrency = DEFAULT_VLM_CONCURRENCY
+    concurrency = max(1, min(concurrency, len(artifacts) or 1))
+    log.event(
+        "phase.vlm.start",
+        f"[3/5] calling VLM per slide (concurrency={concurrency})",
+        concurrency=concurrency,
+    )
+
+    # Pre-load per-slide inputs in slide order.
+    inputs_by_idx: dict[int, tuple[Any, ...]] = {}
+    for art in artifacts:
+        manifest = json.loads(art.manifest_path.read_text())
+        notes = art.notes_path.read_text()
+        chrome = json.loads(art.chrome_path.read_text())
+        png = pngs[art.slide_index - 1]
+        inputs_by_idx[art.slide_index] = (manifest, notes, chrome, png)
+
+    docs_by_idx: dict[int, dict[str, Any]] = {}
+    attempts_by_idx: dict[int, int] = {}
+
+    def _run_one(slide_index: int) -> tuple[int, dict[str, Any], int]:
+        manifest, notes, chrome, png = inputs_by_idx[slide_index]
+        log.event("vlm.start", f"      slide {slide_index} → VLM ...", slide_index=slide_index)
+        doc, n_attempts = call_vlm(
+            png, manifest, notes, chrome,
+            debug_dir=debug_dir, slide_index=slide_index, logger=log,
+        )
+        (debug_dir / f"slide_doc-{slide_index}.json").write_text(
+            json.dumps(doc, indent=2, ensure_ascii=False)
+        )
+        return slide_index, doc, n_attempts
+
+    try:
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            futures = {pool.submit(_run_one, art.slide_index): art.slide_index for art in artifacts}
+            for fut in as_completed(futures):
+                idx, doc, n_attempts = fut.result()
+                docs_by_idx[idx] = doc
+                attempts_by_idx[idx] = n_attempts
     except ValidationFailure as e:
         out = [v.to_dict() for v in e.violations]
         (debug_dir / "validation_errors.json").write_text(
@@ -143,17 +169,86 @@ def main(argv: list[str]) -> int:
             n_violations=len(e.violations),
         )
         return 1
+
+    # Re-assemble in slide order so downstream stages stay deterministic.
+    slide_docs: list[dict[str, Any]] = [docs_by_idx[art.slide_index] for art in artifacts]
+    manifests: list[dict[str, Any]] = [inputs_by_idx[art.slide_index][0] for art in artifacts]
+    chrome_per_slide: list[dict[str, Any]] = [inputs_by_idx[art.slide_index][2] for art in artifacts]
+    # Attempts histogram — generalization monitor. A healthy run is mostly
+    # bucket "1×". A spike in 2×/3× across many slides on a new deck is the
+    # earliest signal that the validator is over-fit (or the model is drifting).
+    attempts_list = [attempts_by_idx[art.slide_index] for art in artifacts]
+    hist: dict[int, int] = {}
+    for a in attempts_list:
+        hist[a] = hist.get(a, 0) + 1
+    n = len(attempts_list)
+    avg = sum(attempts_list) / n if n else 0.0
+    hist_pretty = ", ".join(f"{k}×: {v}" for k, v in sorted(hist.items()))
     log.event(
         "phase.vlm.done",
-        f"      VLM phase: {time.monotonic() - t:.1f}s for {len(slide_docs)} slide(s)",
+        f"      VLM phase: {time.monotonic() - t:.1f}s for {len(slide_docs)} slide(s); "
+        f"attempts avg={avg:.2f} hist=[{hist_pretty}]",
         seconds=round(time.monotonic() - t, 3),
         slides=len(slide_docs),
+        attempts_avg=round(avg, 3),
+        attempts_hist=hist,
+        attempts_per_slide=attempts_by_idx,
     )
+
+    # 3.5 Lazy crop: the model may reference Group shapes that extract.py skipped
+    # because their bbox was below GROUP_AREA_THRESHOLD. Crop those on demand so
+    # md.py never has to render `<!-- missing image: ... -->`.
+    media_dir = out_root / "media"
+    media_dir.mkdir(parents=True, exist_ok=True)
+    n_lazy = 0
+    for art, doc, manifest in zip(artifacts, slide_docs, manifests):
+        by_id = {s["id"]: s for s in manifest.get("shapes", [])}
+        existing = sum(1 for s in manifest.get("shapes", []) if s.get("image_path"))
+        fig_idx = existing  # continue numbering from where extract.py stopped
+
+        def _ensure_cropped(sid: str) -> None:
+            nonlocal fig_idx, n_lazy
+            shape = by_id.get(sid)
+            if shape is None or shape.get("image_path") or not shape.get("bbox_frac"):
+                return
+            fig_idx += 1
+            crop_name = f"slide{art.slide_index}-fig{fig_idx}.png"
+            crop_path = media_dir / crop_name
+            crop_bbox(pngs[art.slide_index - 1], shape["bbox_frac"], crop_path)
+            shape["image_path"] = f"media/{crop_name}"
+            n_lazy += 1
+            log.event(
+                "vlm.lazy_crop",
+                f"      slide {art.slide_index}: lazy-cropped {sid} → {crop_name}",
+                slide_index=art.slide_index,
+                shape_id=sid,
+                kind=shape.get("kind"),
+                bbox_frac=shape.get("bbox_frac"),
+                image_path=shape["image_path"],
+            )
+
+        for b in doc.get("blocks", []) or []:
+            kind = b.get("kind")
+            if kind == "image":
+                _ensure_cropped(b.get("manifest_shape_id", ""))
+            elif kind == "image_row":
+                for it in b.get("images", []) or []:
+                    _ensure_cropped(it.get("manifest_shape_id", ""))
+            elif kind == "table":
+                for row in b.get("rows", []) or []:
+                    for cell in row:
+                        if isinstance(cell, dict) and cell.get("manifest_shape_id"):
+                            _ensure_cropped(cell["manifest_shape_id"])
+    if n_lazy:
+        log.event(
+            "phase.vlm.lazy_crop_done",
+            f"      lazy-cropped {n_lazy} referenced shape(s) that were below the area threshold",
+            n_lazy=n_lazy,
+        )
 
     # 4. join (v1 N=1: identity; for N>1 we just concatenate per-slide markdown)
     log.event("phase.md.start", "[4/5] rendering markdown")
     parts: list[str] = []
-    media_dir = out_root / "media"
     for art, doc, manifest in zip(artifacts, slide_docs, manifests):
         # Copy the full rendered slide PNG into media/ so the markdown's leading
         # reference image resolves alongside the other figures.

@@ -250,8 +250,17 @@ def _is_substring_of_any(s: str, manifest_texts: list[str]) -> bool:
     return any(s in t for t in manifest_texts)
 
 
+# Fields whose value is the model's free-form description, not a transcription
+# of slide text. The substring rule does not apply (alt is an a11y description,
+# not OCR; treating it as transcription is a validator concept error).
+_DESCRIPTIVE_FIELDS = ("alt",)
+
+
 def _check_text(value: str, field: str, idx: int, texts: list[str], out: list[Violation]) -> None:
     if not isinstance(value, str):
+        return
+    # Skip substring check for descriptive fields (alt, …).
+    if any(field == d or field.endswith("." + d) for d in _DESCRIPTIVE_FIELDS):
         return
     if value and not _is_substring_of_any(value, texts):
         out.append(
@@ -276,8 +285,11 @@ def validate(slide_doc: dict[str, Any], manifest: dict[str, Any]) -> list[Violat
     _check_text(slide_doc.get("slide_title", ""), "slide_title", -1, texts, violations)
     if slide_doc.get("slide_subtitle"):
         _check_text(slide_doc["slide_subtitle"], "slide_subtitle", -1, texts, violations)
-    for i, mark in enumerate(slide_doc.get("confidentiality_marks", []) or []):
-        _check_text(mark, f"confidentiality_marks[{i}]", -1, texts, violations)
+    # NOTE: confidentiality_marks is a classification label (e.g. "Confidential",
+    # "Internal Use Only") — typically inherited from the master slide and often
+    # filtered out as chrome before the manifest is built. We do not enforce the
+    # substring check on it; the model's job here is to *categorize* the slide,
+    # not to transcribe a string that's guaranteed to be present.
 
     for idx, b in enumerate(slide_doc.get("blocks", []) or []):
         kind = b.get("kind")
@@ -552,8 +564,8 @@ def call_vlm(
     debug_dir: Path | None = None,
     slide_index: int | None = None,
     logger: Any | None = None,
-) -> dict[str, Any]:
-    """Call the VLM, validate, retry up to MAX_RETRIES, return the validated SlideDoc.
+) -> tuple[dict[str, Any], int]:
+    """Call the VLM, validate, retry up to MAX_RETRIES, return (slide_doc, n_attempts).
 
     If `debug_dir` and `slide_index` are provided, the final messages array
     (including any retry turns) is written to `<debug_dir>/prompt-{slide_index}.json`
@@ -660,7 +672,30 @@ def call_vlm(
                         seconds_total=round(cumulative_seconds, 3),
                         usage_total=cumulative_usage,
                     )
-                return slide_doc
+                return slide_doc, n_attempts
+            if logger is not None:
+                # Include the offending value (truncated) so the user can compare
+                # it to the manifest text without opening prompt-{i}.json.
+                def _short(v: Any, n: int = 80) -> str:
+                    if v is None:
+                        return "None"
+                    s = str(v).replace("\n", "⏎").replace("\r", "")
+                    return s if len(s) <= n else s[:n] + "…"
+
+                preview = "; ".join(
+                    f"[{v.block_index}].{v.field}={_short(v.value)!r}"
+                    for v in last_violations[:3]
+                )
+                more = f" (+{len(last_violations) - 3} more)" if len(last_violations) > 3 else ""
+                logger.event(
+                    "vlm.invalid",
+                    f"      slide {slide_index} attempt {n_attempts} invalid "
+                    f"({len(last_violations)} violation(s)): {preview}{more}",
+                    slide_index=slide_index,
+                    attempt=n_attempts,
+                    n_violations=len(last_violations),
+                    violations=[v.to_dict() for v in last_violations],
+                )
             # Append the assistant turn and a tool-result message echoing the violations.
             messages.append(
                 {
