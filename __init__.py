@@ -1,0 +1,1 @@
+"""Generic PPTX → Markdown pipeline."""
