@@ -42,7 +42,7 @@ export PPT2MD_MODEL=kimi-k2.6                       # optional; this is the defa
 ## Usage
 
 ```sh
-python -m ppt2md [--stream] <pptx> <out_dir>
+python -m ppt2md [--stream] [--upload {none,s3,cmd}] <pptx> <out_dir>
 ```
 
 Example:
@@ -50,6 +50,20 @@ Example:
 ```sh
 python -m ppt2md deck.pptx /tmp/run-1
 ```
+
+### Tunable constants (env vars)
+
+Pipeline thresholds and timeouts read from the environment at import time;
+unset means use the default. Invalid values fail loud rather than silently
+falling back, so a typo is caught early.
+
+| Env var | Default | Used in | Meaning |
+|---|---|---|---|
+| `PPT2MD_GROUP_AREA_THRESHOLD` | `0.05` | `extract.py` | Min fraction of slide area for a Group to count as image-like |
+| `PPT2MD_CROP_PAD_FRAC` | `0.02` | `extract.py` | Padding around each crop, as a fraction of slide width |
+| `PPT2MD_MAX_RETRIES` | `4` | `vlm.py` | Outer validator-driven retry budget per slide |
+| `PPT2MD_REQUEST_TIMEOUT_S` | `120.0` | `vlm.py` | Per-request HTTP timeout (seconds) |
+| `PPT2MD_VLM_CONCURRENCY` | `8` | `cli.py` | Max in-flight slide VLM calls |
 
 ### Streaming mode
 
@@ -90,6 +104,46 @@ On validation failure after retries the stream terminates with:
 Stderr keeps the human/debug log; stdout is reserved for NDJSON when
 `--stream` is on. Media paths in `slide` events are relative to `out_dir`
 from the `start` event, matching the image links inside the markdown.
+
+### Remote image hosting (`--upload`)
+
+By default the rendered markdown references local files under
+`<out_dir>/<stem>/media/`. For deployments that need the markdown to be
+self-contained over HTTP — e.g. piped into a chat thread, indexed by an
+LLM service, embedded in a CMS — `--upload` mirrors every figure (cropped
+shapes + the full-slide reference image) to remote storage and rewrites the
+markdown image links to the returned URLs. Local files are still written so
+re-runs and debug remain straightforward.
+
+Built-in providers:
+
+| `--upload` | Required env vars | URL returned |
+|---|---|---|
+| `none` (default) | — | `<stem>/media/<file>` (local relative) |
+| `s3` | `PPT2MD_S3_BUCKET` (+ optional `PPT2MD_S3_PREFIX`, `PPT2MD_S3_PUBLIC_BASE`, `PPT2MD_S3_ACL`, `PPT2MD_S3_CONTENT_TYPE`) | `https://<base>/…` if `PPT2MD_S3_PUBLIC_BASE` is set, else `s3://<bucket>/<prefix>/<key>` |
+| `cmd` | `PPT2MD_UPLOAD_CMD` (shell template with `{src}` / `{key}`; last stdout line = URL) | whatever the command echoes |
+
+S3 example:
+
+```sh
+pip install boto3
+export PPT2MD_S3_BUCKET=my-decks
+export PPT2MD_S3_PREFIX=2026/q1
+export PPT2MD_S3_PUBLIC_BASE=https://cdn.example.com
+python -m ppt2md --upload s3 deck.pptx /tmp/run-1
+```
+
+Custom-command example (any HTTP store):
+
+```sh
+export PPT2MD_UPLOAD_CMD='curl -s -F file=@{src} -F key={key} https://my-uploader/internal | jq -r .url'
+python -m ppt2md --upload cmd deck.pptx /tmp/run-1
+```
+
+Object keys mirror the local layout (`<stem>/media/<file>`), so re-runs to a
+fresh `<out_dir>` upload to deterministic URLs. To plug in a custom Python
+uploader, implement the `Uploader` protocol in `ppt2md/upload.py` (one method:
+`upload(src: Path, key: str) -> str`) and call `make_uploader` directly.
 
 For input `deck.pptx` and `<out_dir> = /tmp/run-1`, the pipeline writes:
 

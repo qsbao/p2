@@ -28,8 +28,32 @@ from openai import APIConnectionError, APITimeoutError, OpenAI
 
 DEFAULT_BASE_URL = "https://api.moonshot.cn/v1"
 DEFAULT_MODEL = "kimi-k2.6"
-MAX_RETRIES = 4
-REQUEST_TIMEOUT_S = 120.0
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError as e:
+        raise RuntimeError(f"invalid {name}={raw!r}: {e}") from e
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError as e:
+        raise RuntimeError(f"invalid {name}={raw!r}: {e}") from e
+
+
+# Outer retry budget (validator-driven). Override via PPT2MD_MAX_RETRIES.
+MAX_RETRIES = _env_int("PPT2MD_MAX_RETRIES", 4)
+# Per-request HTTP timeout in seconds. Override via PPT2MD_REQUEST_TIMEOUT_S.
+REQUEST_TIMEOUT_S = _env_float("PPT2MD_REQUEST_TIMEOUT_S", 120.0)
 # Disable the OpenAI SDK's internal retry loop — our outer MAX_RETRIES loop
 # is the single source of truth. Otherwise a hang costs (SDK_retries+1) ×
 # REQUEST_TIMEOUT_S per outer attempt, which compounds badly.

@@ -14,6 +14,7 @@ VLM emits must be a substring of some manifest shape's `text` field.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -24,10 +25,25 @@ from pptx.enum.shapes import MSO_SHAPE_TYPE
 from pptx.shapes.group import GroupShape
 
 
-# Group bbox must cover ≥5% of slide area to count as image-like (Q5).
-GROUP_AREA_THRESHOLD = 0.05
-# Pad crops by 2% of slide width so anti-aliased edges aren't clipped (Q5).
-CROP_PAD_FRAC = 0.02
+def _env_float(name: str, default: float) -> float:
+    """Read a float from `os.environ[name]`. Fail loud on invalid values so a
+    typo (`PPT2MD_CROP_PAD_FRAC=2%`) doesn't silently fall back to the default
+    and confuse future tuning."""
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError as e:
+        raise RuntimeError(f"invalid {name}={raw!r}: {e}") from e
+
+
+# Group bbox must cover ≥this fraction of slide area to count as image-like (Q5).
+# Override via PPT2MD_GROUP_AREA_THRESHOLD.
+GROUP_AREA_THRESHOLD = _env_float("PPT2MD_GROUP_AREA_THRESHOLD", 0.05)
+# Pad crops by this fraction of slide width so anti-aliased edges aren't clipped (Q5).
+# Override via PPT2MD_CROP_PAD_FRAC.
+CROP_PAD_FRAC = _env_float("PPT2MD_CROP_PAD_FRAC", 0.02)
 
 
 @dataclass

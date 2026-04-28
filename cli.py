@@ -43,6 +43,7 @@ from .extract import SlideArtifact, crop_bbox, extract
 from .log import RunLogger
 from .md import render_md
 from .render import render
+from .upload import NoopUploader, Uploader, make_uploader
 from .vlm import ValidationFailure, call_vlm
 
 
@@ -101,11 +102,15 @@ def _finalize_slide(
     media_dir: Path,
     image_dir_rel: str,
     log: RunLogger,
+    uploader: Uploader,
 ) -> tuple[str, list[str], int]:
     """Per-slide post-VLM work: lazy-crop referenced shapes, copy the full
-    rendered slide PNG into media/, then render markdown.
+    rendered slide PNG into media/, optionally upload all images to remote
+    storage, then render markdown.
 
-    Returns (markdown, media_paths_relative_to_out_dir, n_lazy_crops).
+    Returns (markdown, media_refs, n_lazy_crops). `media_refs` are the URLs
+    or paths embedded in the rendered markdown — remote URLs when an Uploader
+    rewrote them, local paths (relative to out_dir) otherwise.
 
     Lazy crop: the model may reference Group shapes that extract.py skipped
     because their bbox was below GROUP_AREA_THRESHOLD. Crop those on demand so
@@ -153,21 +158,65 @@ def _finalize_slide(
     full_dst = media_dir / f"slide{art.slide_index}-full.png"
     shutil.copyfile(slide_png, full_dst)
 
-    # Media paths relative to <out_dir>; consumer joins with out_dir from the
-    # start event. The markdown's image links use the same prefix so a consumer
-    # whose cwd is out_dir resolves both consistently.
+    # Path prefix for local references (e.g. "deck/media/slide1-fig1.png");
+    # also serves as the upload-key prefix so remote keys mirror the local
+    # layout. Re-runs to a fresh out_dir hit deterministic keys.
     prefix = image_dir_rel.rstrip("/") if image_dir_rel and image_dir_rel != "." else ""
     def _rel(p: str) -> str:
         return f"{prefix}/{p}" if prefix else p
 
-    media_rel = [_rel(f"media/{full_dst.name}")]
+    is_remote = not isinstance(uploader, NoopUploader)
+
+    # Upload (or no-op) per shape image. Mutate manifest in-memory so the
+    # renderer picks up remote URLs naturally; the on-disk manifest-N.json
+    # keeps local paths for debug/re-upload.
+    if is_remote:
+        for s in manifest.get("shapes", []):
+            ip = s.get("image_path")
+            if not ip:
+                continue
+            local = (media_dir.parent / ip).resolve()
+            key = _rel(ip)
+            url = uploader.upload(local, key)
+            s["image_path"] = url
+            log.event(
+                "upload.shape",
+                f"      slide {art.slide_index}: uploaded {key} → {url}",
+                slide_index=art.slide_index,
+                shape_id=s.get("id"),
+                key=key,
+                url=url,
+            )
+
+    full_key = _rel(f"media/{full_dst.name}")
+    full_url: str
+    if is_remote:
+        full_url = uploader.upload(full_dst, full_key)
+        log.event(
+            "upload.full_slide",
+            f"      slide {art.slide_index}: uploaded {full_key} → {full_url}",
+            slide_index=art.slide_index,
+            key=full_key,
+            url=full_url,
+        )
+    else:
+        full_url = full_key
+
+    media_refs: list[str] = [full_url]
     for s in manifest.get("shapes", []):
         ip = s.get("image_path")
-        if ip:
-            media_rel.append(_rel(ip))
+        if not ip:
+            continue
+        media_refs.append(ip if "://" in ip else _rel(ip))
 
-    md = render_md(doc, manifest, image_dir_rel=image_dir_rel, slide_number=art.slide_index)
-    return md, media_rel, n_lazy
+    md = render_md(
+        doc,
+        manifest,
+        image_dir_rel=image_dir_rel,
+        slide_number=art.slide_index,
+        full_slide_image_url=full_url if is_remote else None,
+    )
+    return md, media_refs, n_lazy
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
@@ -183,6 +232,15 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help="Emit NDJSON events on stdout (one per line) as each slide becomes "
              "ready; slides are emitted in slide-index order. The full .md is "
              "still written to disk.",
+    )
+    p.add_argument(
+        "--upload",
+        choices=["none", "s3", "cmd"],
+        default="none",
+        help="Upload cropped figures to remote storage and reference the URLs "
+             "from the rendered markdown. `s3` uses boto3 (set "
+             "PPT2MD_S3_BUCKET, etc.); `cmd` runs PPT2MD_UPLOAD_CMD per file. "
+             "Default `none` keeps local relative paths.",
     )
     return p.parse_args(argv[1:])
 
@@ -206,11 +264,20 @@ def main(argv: list[str]) -> int:
     pptx: Path = args.pptx
     out_dir: Path = args.out_dir
     stream: bool = args.stream
+    upload_name: str = args.upload
 
     if not pptx.is_file():
         print(f"error: pptx not found: {pptx}", file=sys.stderr, flush=True)
         if stream:
             _emit_event({"type": "error", "stage": "args", "message": f"pptx not found: {pptx}"})
+        return 1
+
+    try:
+        uploader = make_uploader(upload_name)
+    except Exception as e:
+        print(f"error: failed to initialize uploader {upload_name!r}: {e}", file=sys.stderr, flush=True)
+        if stream:
+            _emit_event({"type": "error", "stage": "upload.init", "message": str(e)})
         return 1
 
     stem = pptx.stem
@@ -220,7 +287,13 @@ def main(argv: list[str]) -> int:
     debug_dir.mkdir(parents=True, exist_ok=True)
     log = RunLogger(debug_dir / "run.log")
     t_pipeline = time.monotonic()
-    log.event("pipeline.start", f"ppt2md: {pptx.name} → {out_dir}", pptx=str(pptx), out_dir=str(out_dir))
+    log.event(
+        "pipeline.start",
+        f"ppt2md: {pptx.name} → {out_dir} (upload={upload_name})",
+        pptx=str(pptx),
+        out_dir=str(out_dir),
+        upload=upload_name,
+    )
 
     # 1. render
     t = time.monotonic()
@@ -256,6 +329,7 @@ def main(argv: list[str]) -> int:
             "out_dir": str(out_dir.resolve()),
             "stem_dir": stem,
             "media_dir": f"{stem}/media",
+            "upload": upload_name,
         })
 
     # 3. VLM call per slide (parallel, results collected as they complete).
@@ -313,9 +387,25 @@ def main(argv: list[str]) -> int:
                 art = arts_by_idx[idx]
                 manifest = inputs_by_idx[idx][0]
                 slide_png = pngs[idx - 1]
-                md_text, media_rel, n_lazy = _finalize_slide(
-                    art, doc, manifest, slide_png, media_dir, stem, log
-                )
+                try:
+                    md_text, media_rel, n_lazy = _finalize_slide(
+                        art, doc, manifest, slide_png, media_dir, stem, log, uploader
+                    )
+                except Exception as e:
+                    log.event(
+                        "phase.finalize.failed",
+                        f"error: slide {idx} finalize failed: {e}",
+                        slide_index=idx,
+                        error=str(e),
+                    )
+                    if stream:
+                        _emit_event({
+                            "type": "error",
+                            "stage": "finalize",
+                            "slide_index": idx,
+                            "message": str(e),
+                        })
+                    raise
                 md_by_idx[idx] = md_text
                 media_by_idx[idx] = media_rel
                 n_lazy_total += n_lazy

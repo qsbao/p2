@@ -32,6 +32,20 @@ from __future__ import annotations
 from typing import Any
 
 
+def _resolve_image_url(image_dir_rel: str, image_path: str) -> str:
+    """Return the URL/path used in the markdown image reference.
+
+    If `image_path` is already a URL (contains `://`, e.g. `https://…` or
+    `s3://…` returned by an Uploader), pass it through unchanged. Otherwise
+    join it with `image_dir_rel` so links resolve from wherever the .md lives.
+    """
+    if "://" in image_path:
+        return image_path
+    if image_dir_rel and image_dir_rel != ".":
+        return f"{image_dir_rel.rstrip('/')}/{image_path}"
+    return image_path
+
+
 def _render_runs(runs: list[dict[str, Any]]) -> str:
     parts: list[str] = []
     for r in runs:
@@ -79,11 +93,7 @@ def _render_image(b: dict[str, Any], manifest: dict[str, Any], image_dir_rel: st
     if shape is None or not shape.get("image_path"):
         return [f"<!-- missing image: {sid} -->"]
 
-    img_path = shape["image_path"]
-    if image_dir_rel and image_dir_rel != ".":
-        rel = f"{image_dir_rel.rstrip('/')}/{img_path}"
-    else:
-        rel = img_path
+    rel = _resolve_image_url(image_dir_rel, shape["image_path"])
 
     def _single_line(s: str) -> str:
         # Markdown alt and italic captions can't span newlines without breaking layout.
@@ -113,11 +123,7 @@ def _render_image_row(b: dict[str, Any], manifest: dict[str, Any], image_dir_rel
         if shape is None or not shape.get("image_path"):
             cells.append(f"<td><!-- missing image: {sid} --></td>")
             continue
-        img_path = shape["image_path"]
-        if image_dir_rel and image_dir_rel != ".":
-            rel = f"{image_dir_rel.rstrip('/')}/{img_path}"
-        else:
-            rel = img_path
+        rel = _resolve_image_url(image_dir_rel, shape["image_path"])
         parts: list[str] = []
         callout = item.get("callout")
         if callout and callout.get("text"):
@@ -192,12 +198,7 @@ def _render_table(b: dict[str, Any], manifest: dict[str, Any], image_dir_rel: st
         if sid:
             shape = _resolve_image(sid, manifest)
             if shape and shape.get("image_path"):
-                img_path = shape["image_path"]
-                rel = (
-                    f"{image_dir_rel.rstrip('/')}/{img_path}"
-                    if image_dir_rel and image_dir_rel != "."
-                    else img_path
-                )
+                rel = _resolve_image_url(image_dir_rel, shape["image_path"])
                 alt = _flatten(c.get("alt") or c.get("text") or "")
                 parts.append(f'<img src="{rel}" alt="{alt}"/>')
             else:
@@ -248,14 +249,21 @@ def render_md(
     manifest: dict[str, Any],
     image_dir_rel: str,
     slide_number: int | None = None,
+    full_slide_image_url: str | None = None,
 ) -> str:
     """Render one slide_doc to markdown.
 
     `image_dir_rel` is prepended to manifest `image_path` so links resolve from
     wherever <stem>.md lives. Pass "<stem>" if .md sits alongside the <stem>/
-    media folder; pass "" if .md sits inside <stem>/.
+    media folder; pass "" if .md sits inside <stem>/. Image paths that already
+    look like URLs (`scheme://…`) are passed through unmodified — useful when
+    an Uploader has rewritten the manifest to point at remote storage.
 
     `slide_number`, when given, is appended to the title as `(slide #N)`.
+
+    `full_slide_image_url`, when given, is used verbatim as the reference image
+    URL under the title. Otherwise the local `<image_dir_rel>/media/slide{N}-full.png`
+    is constructed.
     """
     paragraphs: list[str] = []
 
@@ -277,11 +285,14 @@ def render_md(
     # Reference image directly under the title so the reader can see the source
     # slide before reading the structured extraction below.
     if slide_number is not None:
-        full_path = (
-            f"{image_dir_rel.rstrip('/')}/media/slide{slide_number}-full.png"
-            if image_dir_rel and image_dir_rel != "."
-            else f"media/slide{slide_number}-full.png"
-        )
+        if full_slide_image_url is not None:
+            full_path = full_slide_image_url
+        else:
+            full_path = (
+                f"{image_dir_rel.rstrip('/')}/media/slide{slide_number}-full.png"
+                if image_dir_rel and image_dir_rel != "."
+                else f"media/slide{slide_number}-full.png"
+            )
         paragraphs.append(
             "Original rendered slide shown below for reference; the structured "
             "extraction follows after."
