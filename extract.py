@@ -342,15 +342,15 @@ def extract(
             "shapes": [asdict(r) for r in records],
         }
         manifest_path = debug_dir / f"manifest-{idx}.json"
-        manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False))
+        manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
 
         # Write notes.
         notes_path = debug_dir / f"notes-{idx}.txt"
-        notes_path.write_text(_extract_notes(slide))
+        notes_path.write_text(_extract_notes(slide), encoding="utf-8")
 
         # Write chrome.
         chrome_path = debug_dir / f"chrome-{idx}.json"
-        chrome_path.write_text(json.dumps(chrome, indent=2))
+        chrome_path.write_text(json.dumps(chrome, indent=2), encoding="utf-8")
 
         artifacts.append(
             SlideArtifact(

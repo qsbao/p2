@@ -21,7 +21,7 @@ class RunLogger:
         self._lock = threading.Lock()
         if log_path is not None:
             log_path.parent.mkdir(parents=True, exist_ok=True)
-            log_path.write_text("")  # truncate
+            log_path.write_text("", encoding="utf-8")  # truncate
 
     def event(self, event: str, message: str | None = None, **fields: Any) -> None:
         rec = {
@@ -33,7 +33,7 @@ class RunLogger:
         rec.update(fields)
         with self._lock:
             if self.log_path is not None:
-                with self.log_path.open("a") as f:
+                with self.log_path.open("a", encoding="utf-8") as f:
                     f.write(json.dumps(rec, ensure_ascii=False) + "\n")
             if message:
                 print(message, file=sys.stderr, flush=True)

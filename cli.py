@@ -1,8 +1,8 @@
 """Pipeline orchestrator (Q9).
 
-    python -m ppt2md <pptx> <out_dir>
+    python -m ppt2md [--stream] <pptx> <out_dir>
 
-Produces:
+Default mode produces:
     <out_dir>/<stem>.md
     <out_dir>/<stem>/media/*.png
     <out_dir>/<stem>.debug/
@@ -10,11 +10,26 @@ Produces:
         slide_doc-{N}.json, chrome_dropped.md
         validation_errors.json   (only on validation failure)
 
+`--stream` adds NDJSON events on stdout (one per line) so downstream tools can
+start consuming markdown the moment each slide is ready. Slides are emitted in
+slide-index order via a reorder buffer (VLM still runs in parallel). Event
+schema:
+
+    {"type":"start","stem":...,"n_slides":N,"out_dir":...,"stem_dir":...,"media_dir":...}
+    {"type":"slide","slide_index":N,"markdown":...,"media":[...]}    (×N)
+    {"type":"done","md_path":...,"seconds_total":...,"chrome_audit_path":...}
+    {"type":"error","stage":...,"message":...}                       (on failure)
+
+The full <stem>.md is still written to disk in stream mode — the stream is
+purely additive. Stderr keeps the human/debug log; stdout is reserved for
+NDJSON when `--stream` is on.
+
 Errors → stderr + nonzero exit. Re-runs overwrite outputs (no caching in v1).
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import shutil
@@ -24,7 +39,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-from .extract import crop_bbox, extract
+from .extract import SlideArtifact, crop_bbox, extract
 from .log import RunLogger
 from .md import render_md
 from .render import render
@@ -69,17 +84,133 @@ def _write_chrome_audit(
         for sid, reason, text in rows:
             lines.append(f"| `{sid}` | {reason} | {text} |")
         lines.append("")
-    (debug_dir / "chrome_dropped.md").write_text("\n".join(lines))
+    (debug_dir / "chrome_dropped.md").write_text("\n".join(lines), encoding="utf-8")
+
+
+def _emit_event(payload: dict[str, Any]) -> None:
+    """Write one NDJSON event to stdout. Each event is a self-contained line."""
+    sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+def _finalize_slide(
+    art: SlideArtifact,
+    doc: dict[str, Any],
+    manifest: dict[str, Any],
+    slide_png: Path,
+    media_dir: Path,
+    image_dir_rel: str,
+    log: RunLogger,
+) -> tuple[str, list[str], int]:
+    """Per-slide post-VLM work: lazy-crop referenced shapes, copy the full
+    rendered slide PNG into media/, then render markdown.
+
+    Returns (markdown, media_paths_relative_to_out_dir, n_lazy_crops).
+
+    Lazy crop: the model may reference Group shapes that extract.py skipped
+    because their bbox was below GROUP_AREA_THRESHOLD. Crop those on demand so
+    md.py never has to render `<!-- missing image: ... -->`.
+    """
+    by_id = {s["id"]: s for s in manifest.get("shapes", [])}
+    existing = sum(1 for s in manifest.get("shapes", []) if s.get("image_path"))
+    fig_idx = existing  # continue numbering from where extract.py stopped
+    n_lazy = 0
+
+    def _ensure_cropped(sid: str) -> None:
+        nonlocal fig_idx, n_lazy
+        shape = by_id.get(sid)
+        if shape is None or shape.get("image_path") or not shape.get("bbox_frac"):
+            return
+        fig_idx += 1
+        crop_name = f"slide{art.slide_index}-fig{fig_idx}.png"
+        crop_path = media_dir / crop_name
+        crop_bbox(slide_png, shape["bbox_frac"], crop_path)
+        shape["image_path"] = f"media/{crop_name}"
+        n_lazy += 1
+        log.event(
+            "vlm.lazy_crop",
+            f"      slide {art.slide_index}: lazy-cropped {sid} → {crop_name}",
+            slide_index=art.slide_index,
+            shape_id=sid,
+            kind=shape.get("kind"),
+            bbox_frac=shape.get("bbox_frac"),
+            image_path=shape["image_path"],
+        )
+
+    for b in doc.get("blocks", []) or []:
+        kind = b.get("kind")
+        if kind == "image":
+            _ensure_cropped(b.get("manifest_shape_id", ""))
+        elif kind == "image_row":
+            for it in b.get("images", []) or []:
+                _ensure_cropped(it.get("manifest_shape_id", ""))
+        elif kind == "table":
+            for row in b.get("rows", []) or []:
+                for cell in row:
+                    if isinstance(cell, dict) and cell.get("manifest_shape_id"):
+                        _ensure_cropped(cell["manifest_shape_id"])
+
+    full_dst = media_dir / f"slide{art.slide_index}-full.png"
+    shutil.copyfile(slide_png, full_dst)
+
+    # Media paths relative to <out_dir>; consumer joins with out_dir from the
+    # start event. The markdown's image links use the same prefix so a consumer
+    # whose cwd is out_dir resolves both consistently.
+    prefix = image_dir_rel.rstrip("/") if image_dir_rel and image_dir_rel != "." else ""
+    def _rel(p: str) -> str:
+        return f"{prefix}/{p}" if prefix else p
+
+    media_rel = [_rel(f"media/{full_dst.name}")]
+    for s in manifest.get("shapes", []):
+        ip = s.get("image_path")
+        if ip:
+            media_rel.append(_rel(ip))
+
+    md = render_md(doc, manifest, image_dir_rel=image_dir_rel, slide_number=art.slide_index)
+    return md, media_rel, n_lazy
+
+
+def _parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="ppt2md",
+        description="Convert a .pptx into markdown + cropped figures.",
+    )
+    p.add_argument("pptx", type=Path, help="Input .pptx file")
+    p.add_argument("out_dir", type=Path, help="Output directory (will be created)")
+    p.add_argument(
+        "--stream",
+        action="store_true",
+        help="Emit NDJSON events on stdout (one per line) as each slide becomes "
+             "ready; slides are emitted in slide-index order. The full .md is "
+             "still written to disk.",
+    )
+    return p.parse_args(argv[1:])
+
+
+def _force_utf8_streams() -> None:
+    """Reconfigure stdout/stderr to UTF-8 so non-ASCII slide content (CJK,
+    smart quotes, etc.) survives locales like `C` / `POSIX` where the default
+    is ASCII. Idempotent and safe under stdout redirection (StringIO etc.)."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8")
+            except Exception:
+                pass
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 3:
-        print("usage: python -m ppt2md <pptx> <out_dir>", file=sys.stderr, flush=True)
-        return 2
-    pptx = Path(argv[1])
-    out_dir = Path(argv[2])
+    _force_utf8_streams()
+    args = _parse_args(argv)
+    pptx: Path = args.pptx
+    out_dir: Path = args.out_dir
+    stream: bool = args.stream
+
     if not pptx.is_file():
         print(f"error: pptx not found: {pptx}", file=sys.stderr, flush=True)
+        if stream:
+            _emit_event({"type": "error", "stage": "args", "message": f"pptx not found: {pptx}"})
         return 1
 
     stem = pptx.stem
@@ -114,7 +245,20 @@ def main(argv: list[str]) -> int:
         seconds=round(time.monotonic() - t, 3),
     )
 
-    # 3. VLM call per slide
+    media_dir = out_root / "media"
+    media_dir.mkdir(parents=True, exist_ok=True)
+
+    if stream:
+        _emit_event({
+            "type": "start",
+            "stem": stem,
+            "n_slides": len(artifacts),
+            "out_dir": str(out_dir.resolve()),
+            "stem_dir": stem,
+            "media_dir": f"{stem}/media",
+        })
+
+    # 3. VLM call per slide (parallel, results collected as they complete).
     t = time.monotonic()
     try:
         concurrency = int(os.environ.get("PPT2MD_VLM_CONCURRENCY", DEFAULT_VLM_CONCURRENCY))
@@ -127,17 +271,22 @@ def main(argv: list[str]) -> int:
         concurrency=concurrency,
     )
 
-    # Pre-load per-slide inputs in slide order.
     inputs_by_idx: dict[int, tuple[Any, ...]] = {}
+    arts_by_idx: dict[int, SlideArtifact] = {}
     for art in artifacts:
-        manifest = json.loads(art.manifest_path.read_text())
-        notes = art.notes_path.read_text()
-        chrome = json.loads(art.chrome_path.read_text())
+        manifest = json.loads(art.manifest_path.read_text(encoding="utf-8"))
+        notes = art.notes_path.read_text(encoding="utf-8")
+        chrome = json.loads(art.chrome_path.read_text(encoding="utf-8"))
         png = pngs[art.slide_index - 1]
         inputs_by_idx[art.slide_index] = (manifest, notes, chrome, png)
+        arts_by_idx[art.slide_index] = art
 
     docs_by_idx: dict[int, dict[str, Any]] = {}
     attempts_by_idx: dict[int, int] = {}
+    md_by_idx: dict[int, str] = {}  # finalized markdown
+    media_by_idx: dict[int, list[str]] = {}  # finalized media paths per slide
+    n_lazy_total = 0
+    next_to_emit = 1  # for the stream reorder buffer
 
     def _run_one(slide_index: int) -> tuple[int, dict[str, Any], int]:
         manifest, notes, chrome, png = inputs_by_idx[slide_index]
@@ -147,7 +296,7 @@ def main(argv: list[str]) -> int:
             debug_dir=debug_dir, slide_index=slide_index, logger=log,
         )
         (debug_dir / f"slide_doc-{slide_index}.json").write_text(
-            json.dumps(doc, indent=2, ensure_ascii=False)
+            json.dumps(doc, indent=2, ensure_ascii=False), encoding="utf-8"
         )
         return slide_index, doc, n_attempts
 
@@ -158,16 +307,50 @@ def main(argv: list[str]) -> int:
                 idx, doc, n_attempts = fut.result()
                 docs_by_idx[idx] = doc
                 attempts_by_idx[idx] = n_attempts
+
+                # Finalize this slide (lazy-crop + copy full PNG + render_md)
+                # immediately so streaming consumers see it ASAP.
+                art = arts_by_idx[idx]
+                manifest = inputs_by_idx[idx][0]
+                slide_png = pngs[idx - 1]
+                md_text, media_rel, n_lazy = _finalize_slide(
+                    art, doc, manifest, slide_png, media_dir, stem, log
+                )
+                md_by_idx[idx] = md_text
+                media_by_idx[idx] = media_rel
+                n_lazy_total += n_lazy
+
+                if stream:
+                    # Drain the reorder buffer in slide-index order. Slides may
+                    # finalize out of order (parallel VLM); we hold completed
+                    # ones until their predecessors are also done so consumers
+                    # see slides 1..N sequentially.
+                    while next_to_emit in md_by_idx:
+                        _emit_event({
+                            "type": "slide",
+                            "slide_index": next_to_emit,
+                            "markdown": md_by_idx[next_to_emit],
+                            "media": media_by_idx[next_to_emit],
+                        })
+                        next_to_emit += 1
     except ValidationFailure as e:
         out = [v.to_dict() for v in e.violations]
         (debug_dir / "validation_errors.json").write_text(
-            json.dumps(out, indent=2, ensure_ascii=False)
+            json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8"
         )
         log.event(
             "phase.vlm.failed",
             f"error: validation failed after retries; see {debug_dir / 'validation_errors.json'}",
             n_violations=len(e.violations),
         )
+        if stream:
+            _emit_event({
+                "type": "error",
+                "stage": "vlm",
+                "message": "validation failed after retries",
+                "violations_path": str(debug_dir / "validation_errors.json"),
+                "n_violations": len(e.violations),
+            })
         return 1
 
     # Re-assemble in slide order so downstream stages stay deterministic.
@@ -195,70 +378,19 @@ def main(argv: list[str]) -> int:
         attempts_per_slide=attempts_by_idx,
     )
 
-    # 3.5 Lazy crop: the model may reference Group shapes that extract.py skipped
-    # because their bbox was below GROUP_AREA_THRESHOLD. Crop those on demand so
-    # md.py never has to render `<!-- missing image: ... -->`.
-    media_dir = out_root / "media"
-    media_dir.mkdir(parents=True, exist_ok=True)
-    n_lazy = 0
-    for art, doc, manifest in zip(artifacts, slide_docs, manifests):
-        by_id = {s["id"]: s for s in manifest.get("shapes", [])}
-        existing = sum(1 for s in manifest.get("shapes", []) if s.get("image_path"))
-        fig_idx = existing  # continue numbering from where extract.py stopped
-
-        def _ensure_cropped(sid: str) -> None:
-            nonlocal fig_idx, n_lazy
-            shape = by_id.get(sid)
-            if shape is None or shape.get("image_path") or not shape.get("bbox_frac"):
-                return
-            fig_idx += 1
-            crop_name = f"slide{art.slide_index}-fig{fig_idx}.png"
-            crop_path = media_dir / crop_name
-            crop_bbox(pngs[art.slide_index - 1], shape["bbox_frac"], crop_path)
-            shape["image_path"] = f"media/{crop_name}"
-            n_lazy += 1
-            log.event(
-                "vlm.lazy_crop",
-                f"      slide {art.slide_index}: lazy-cropped {sid} → {crop_name}",
-                slide_index=art.slide_index,
-                shape_id=sid,
-                kind=shape.get("kind"),
-                bbox_frac=shape.get("bbox_frac"),
-                image_path=shape["image_path"],
-            )
-
-        for b in doc.get("blocks", []) or []:
-            kind = b.get("kind")
-            if kind == "image":
-                _ensure_cropped(b.get("manifest_shape_id", ""))
-            elif kind == "image_row":
-                for it in b.get("images", []) or []:
-                    _ensure_cropped(it.get("manifest_shape_id", ""))
-            elif kind == "table":
-                for row in b.get("rows", []) or []:
-                    for cell in row:
-                        if isinstance(cell, dict) and cell.get("manifest_shape_id"):
-                            _ensure_cropped(cell["manifest_shape_id"])
-    if n_lazy:
+    if n_lazy_total:
         log.event(
             "phase.vlm.lazy_crop_done",
-            f"      lazy-cropped {n_lazy} referenced shape(s) that were below the area threshold",
-            n_lazy=n_lazy,
+            f"      lazy-cropped {n_lazy_total} referenced shape(s) that were below the area threshold",
+            n_lazy=n_lazy_total,
         )
 
-    # 4. join (v1 N=1: identity; for N>1 we just concatenate per-slide markdown)
+    # 4. join — concatenate finalized per-slide markdown in slide order.
     log.event("phase.md.start", "[4/5] rendering markdown")
-    parts: list[str] = []
-    for art, doc, manifest in zip(artifacts, slide_docs, manifests):
-        # Copy the full rendered slide PNG into media/ so the markdown's leading
-        # reference image resolves alongside the other figures.
-        src = pngs[art.slide_index - 1]
-        dst = media_dir / f"slide{art.slide_index}-full.png"
-        shutil.copyfile(src, dst)
-        parts.append(render_md(doc, manifest, image_dir_rel=stem, slide_number=art.slide_index))
+    parts = [md_by_idx[art.slide_index] for art in artifacts]
     md_text = "\n".join(parts)
     md_path = out_dir / f"{stem}.md"
-    md_path.write_text(md_text)
+    md_path.write_text(md_text, encoding="utf-8")
     log.event("phase.md.done", f"      wrote {md_path} ({len(md_text)} chars)", path=str(md_path), chars=len(md_text))
 
     # 5. audit trail
@@ -269,11 +401,20 @@ def main(argv: list[str]) -> int:
         [doc.get("dropped_chrome", []) or [] for doc in slide_docs],
         manifests,
     )
+    seconds_total = round(time.monotonic() - t_pipeline, 3)
     log.event(
         "pipeline.done",
-        f"done: {md_path}  ({time.monotonic() - t_pipeline:.1f}s total)",
-        seconds_total=round(time.monotonic() - t_pipeline, 3),
+        f"done: {md_path}  ({seconds_total:.1f}s total)",
+        seconds_total=seconds_total,
     )
+
+    if stream:
+        _emit_event({
+            "type": "done",
+            "md_path": str(md_path.resolve()),
+            "seconds_total": seconds_total,
+            "chrome_audit_path": str((debug_dir / "chrome_dropped.md").resolve()),
+        })
     return 0
 
 

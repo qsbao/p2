@@ -28,7 +28,7 @@ from openai import APIConnectionError, APITimeoutError, OpenAI
 
 DEFAULT_BASE_URL = "https://api.moonshot.cn/v1"
 DEFAULT_MODEL = "kimi-k2.6"
-MAX_RETRIES = 2
+MAX_RETRIES = 4
 REQUEST_TIMEOUT_S = 120.0
 # Disable the OpenAI SDK's internal retry loop — our outer MAX_RETRIES loop
 # is the single source of truth. Otherwise a hang costs (SDK_retries+1) ×
@@ -244,10 +244,24 @@ class ValidationFailure(Exception):
         self.violations = violations
 
 
+def _normalize_ws(s: str) -> str:
+    """Collapse all whitespace runs to a single space and strip ends.
+
+    Manifest text often has double-space artifacts ("Coronus:  Dielectric")
+    inherited from PPT layouts; models silently normalize them. A byte-exact
+    substring check then rejects the (faithful) transcription. We compare on
+    a whitespace-normalized form on both sides instead.
+    """
+    return " ".join(s.split())
+
+
 def _is_substring_of_any(s: str, manifest_texts: list[str]) -> bool:
     if not s:
         return True
-    return any(s in t for t in manifest_texts)
+    if any(s in t for t in manifest_texts):
+        return True
+    ns = _normalize_ws(s)
+    return any(ns in _normalize_ws(t) for t in manifest_texts)
 
 
 # Fields whose value is the model's free-form description, not a transcription
@@ -557,7 +571,7 @@ def _dump_prompt(
         "messages": _redact_image_urls(messages, slide_png),
     }
     (debug_dir / f"prompt-{slide_index}.json").write_text(
-        json.dumps(out, indent=2, ensure_ascii=False)
+        json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8"
     )
 
 

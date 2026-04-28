@@ -42,7 +42,7 @@ export PPT2MD_MODEL=kimi-k2.6                       # optional; this is the defa
 ## Usage
 
 ```sh
-python -m ppt2md <pptx> <out_dir>
+python -m ppt2md [--stream] <pptx> <out_dir>
 ```
 
 Example:
@@ -50,6 +50,46 @@ Example:
 ```sh
 python -m ppt2md deck.pptx /tmp/run-1
 ```
+
+### Streaming mode
+
+`--stream` emits NDJSON events on stdout (one per line) so downstream tools
+can start consuming markdown the moment each slide is ready. Slides are
+emitted in slide-index order via a reorder buffer (the VLM still runs in
+parallel underneath). The full `<stem>.md` and all debug artifacts are still
+written to disk — the stream is purely additive.
+
+```sh
+python -m ppt2md --stream deck.pptx /tmp/run-1 \
+    | python ../scripts/stream_consumer.py
+```
+
+Event schema:
+
+```jsonc
+{"type":"start", "stem":"deck", "n_slides":42, "out_dir":"/tmp/run-1",
+ "stem_dir":"deck", "media_dir":"deck/media"}
+
+{"type":"slide", "slide_index":1, "markdown":"# ...\n",
+ "media":["deck/media/slide1-full.png", "deck/media/slide1-fig1.png", ...]}
+
+// ... one slide event per slide, in slide-index order ...
+
+{"type":"done", "md_path":"/tmp/run-1/deck.md", "seconds_total":312.4,
+ "chrome_audit_path":"/tmp/run-1/deck.debug/chrome_dropped.md"}
+```
+
+On validation failure after retries the stream terminates with:
+
+```jsonc
+{"type":"error", "stage":"vlm", "message":"validation failed after retries",
+ "violations_path":"/tmp/run-1/deck.debug/validation_errors.json",
+ "n_violations":3}
+```
+
+Stderr keeps the human/debug log; stdout is reserved for NDJSON when
+`--stream` is on. Media paths in `slide` events are relative to `out_dir`
+from the `start` event, matching the image links inside the markdown.
 
 For input `deck.pptx` and `<out_dir> = /tmp/run-1`, the pipeline writes:
 
